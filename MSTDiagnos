@@ -1,0 +1,129 @@
+#!/bin/bash
+# -----------------------------------------------------------------------
+# Copyright Microsoft Corporation. All rights reserved.
+#
+# 2024-07-28
+# -----------------------------------------------------------------------
+
+export TEXTDOMAIN=mstunnel
+
+function ShowUsage
+{
+    script_name=${0##*/}
+    echo "$(gettext "Usage"): $script_name $(gettext "[command]")"
+    echo ""
+    echo "$(gettext "Commands")"
+    echo "  testconn [URIofInternalWebsite]   $(gettext "Verify Internal Network accessibility, please specify use this format: https://<FQDN>")"
+    echo "  collectlogs     $(gettext "Collect Logs for troubleshooting")"
+}
+
+function ProcessArgs
+{
+    # Check if at least one argument is provided
+    (( $# < 1 )) && ShowUsage && return 0
+
+    Command=${1}
+
+    case "${Command}" in
+        testconn)
+            testInternalConnectivity $2
+        ;;
+        collectlogs)
+            CollectLogs
+        ;;
+        *)
+            ShowUsage
+        ;;
+    esac
+}
+
+function testInternalConnectivity
+{
+    if [ -z "$1" ]; then
+        echo "No URI provided for testconn."
+        exit 1
+    else
+        echo "Testing connectivity to $1..."
+        URI=$1
+
+        # Test connectivity using curl
+        echo "Start connectvitiy test"
+        response=$(podman exec -it mstunnel-server curl -I --silent --output /dev/null --write-out "%{http_code}" "$URI")
+
+        if [ "$response" -eq 200 ]; then
+        # If curl exits with code 200, it means the connection failed
+            echo -e ${success_txt}$(gettext "Success"): $(gettext "The internal website $URI is reachable from tunnel server")${normal_txt}
+
+        else
+            echo "Cannot establish HTTPS connection with the internal website, or the internal website is not replied with 200, now checking the reasons" 
+       # Check for TLS handshake failure due to firewall
+            debugresponse=$(podman exec -it mstunnel-server curl -v --silent "$URI" 2>&1)
+	    echo "$debugresponse"
+            tls_clienthello=$(echo "$debugresponse" | grep -i "Client Hello")
+            tls_serverhello=$(echo "$debugresponse" | grep -i "Server Hello")
+            tls_unknown_ca=$(echo "$debugresponse" | grep -i "unknown CA")
+            if [ "$tls_clienthello" == *"Client Hello"* ]&&[ "$tls_serverhello" != *"Server Hello"* ]; then
+                echo -e ${error_txt}$(gettext "Error"): $(gettext "There may be a firewall blocking access to this URI. The connection failed after client sends out TLS client hello")${normal_txt}
+	    fi
+
+        # Check for TLS handshake failure due to unknown CA
+            if [[ "$tls_unknown_ca" == *"unknown CA"* ]]; then
+                echo -e ${error_txt}$(gettext "Error"): $(gettext "The CA of this website is not trusted, please import the CA's certificate. Refer to: https://learn.microsoft.com/en-us/mem/intune/protect/microsoft-tunnel-configure#add-trusted-root-certificates-to-tunnel-containers")${normal_txt}
+	    fi
+
+        fi
+    fi
+
+}
+
+function HealthCheck
+{
+    #check OS version and kernal version
+    #check Podman version, network configuration, and storage configuration
+    #check the status of containers and images
+    #check required services and conflict services: iptables, firewalld(conflict)
+    #Status of the MS tunnel application
+    podman exec -it mstunnel-server curl --insecure https://127.0.0.1
+    curl --insecure https://127.0.0.1
+    #iptable rules
+}
+
+function CollectLogs
+{
+    ##create the folder for log collection
+    Timestamp=$(date +"%Y%m%d%H%M%S")
+    Outputfile="/tmp/DiagLogs-$Timestamp.tar.gz"
+    Targetfolder="/tmp/LogColletion$Timestamp"
+    mkdir $Targetfolder
+    
+    echo "Start to collect logs"
+    #Result of one,two,three
+    
+    ##collect history command
+    history > $Targetfolder/history.txt
+    ##collect processes
+    ps -A > $Targetfolder/processes.txt
+    ##collect agent certificate
+    openssl pkcs12 -in /etc/mstunnel/private/agent.p12 -passin pass: -info -nokeys > $Targetfolder/agentCert.crt  
+    ##collect files in /etc/mstunnel except private folder(so private key is not saved)
+    tar -czvf $Targetfolder/mstunnelconfig_backup.tar.gz --exclude='/etc/mstunnel/private' /etc/mstunnel
+    ##collect files in /tmp/mstunnel folder if it exists
+    if test -d /tmp/mstunnel; then
+        tar -czvf $Targetfolder/tmptunnel_backup.tar.gz /tmp/mstunnel
+    else
+        echo "The /tmp/mstunnel folder does not exist." >> $Targetfolder/result.txt
+    fi
+
+    ##collect server logs
+    journalctl -t ocserv -t mstunnel-agent -t mstunnel_monitor > $Targetfolder/MStunnellogs
+    
+    tar -czvf "$Outputfile" "$Targetfolder"
+    rm -rf "$Targetfolder"
+    echo "Logs are collected and saved in DiagLogs-$Timestamp.tar.gz"
+}
+
+error_txt="\033[41m\033[30m"
+success_txt="\033[40m\033[32m"
+normal_txt="\033[39m\033[22m\033[49m"
+
+ProcessArgs "$@"
